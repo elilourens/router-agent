@@ -6,13 +6,15 @@ import re
 from typing import List
 
 from pydantic import BaseModel, RootModel, ValidationError
-from langchain_ollama import OllamaLLM
+
+# ← use the chat interface
+from langchain_ollama import ChatOllama
+from langchain_core.messages import SystemMessage, HumanMessage
+
 from langgraph.graph import StateGraph, START, END
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-
 
 
 class SubQuery(BaseModel):
@@ -26,16 +28,12 @@ class AgentState(BaseModel):
     previous_qas: List[str] = []
 
 
-
 class SubqueriesModel(RootModel[List[str]]):
     """Validates that the LLM output is a JSON array of strings."""
 
 
-
 class RankedModel(RootModel[List[str]]):
     """Validates that the LLM output is a JSON array of strings."""
-
-
 
 
 def get_user_query(state: AgentState) -> dict:
@@ -44,17 +42,19 @@ def get_user_query(state: AgentState) -> dict:
     return {"user_query": q}
 
 
-
-
 def classify_query(state: AgentState) -> dict:
     logger.info(f"State before classification: {state}")
-    prompt = (
-        "Split the following user question into its sub‑queries, "
-        "and respond *only* with a JSON array of strings. "
-        "If there are no sub‑queries, return an empty array.\n\n"
-        f"Question: {state.user_query}"
+
+    system = SystemMessage(
+        content=(
+            "Split the following user question into its sub‑queries, "
+            "and respond *only* with a JSON array of strings. "
+            "If there are no sub‑queries, return an empty array."
+        )
     )
-    raw = llm.invoke(prompt)
+    user = HumanMessage(content=state.user_query or "")
+    resp = llm.invoke([system, user])
+    raw = resp.content
 
     try:
         model = SubqueriesModel.model_validate_json(raw)
@@ -75,25 +75,25 @@ def classify_query(state: AgentState) -> dict:
     return {"sub_queries": sub_qs}
 
 
-
-
 def rank_queries(state: AgentState) -> dict:
     logger.info(f"State before ranking: {state}")
     texts = [sq.text for sq in state.sub_queries]
-    prompt = (
-        "Given these sub‑queries, respond *only* with a JSON array of strings "
-        "Rank them in the most logical order to answer."
-        "Do *not* include any answers or extra commentary.\n\n"
-        f"Sub‑queries: {json.dumps(texts, ensure_ascii=False)}"
-    )
-    raw = llm.invoke(prompt)
 
-    
+    system = SystemMessage(
+        content=(
+            "Given these sub‑queries, respond *only* with a JSON array of strings. "
+            "Rank them in the most logical order to answer. "
+            "Do *not* include any answers or extra commentary."
+        )
+    )
+    user = HumanMessage(content=json.dumps(texts, ensure_ascii=False))
+    resp = llm.invoke([system, user])
+    raw = resp.content
+
     try:
         model = RankedModel.model_validate_json(raw)
         strings = model.root
     except ValidationError:
-        
         match = re.search(r'(\[.*?\])', raw, re.DOTALL)
         if match:
             try:
@@ -105,32 +105,26 @@ def rank_queries(state: AgentState) -> dict:
         else:
             strings = []
 
-    
-    
-
     ranked = [SubQuery(text=s) for s in strings]
     return {"ranked_queries": ranked}
 
 
-
-
-def setup_llm() -> OllamaLLM:
-    return OllamaLLM(model="deepseek-r1", reasoning=False)
-
-
+def setup_llm() -> ChatOllama:
+    return ChatOllama(
+        model="ollama3.2-3B",
+        base_url="http://host.docker.internal:11434"
+    )
 
 
 def main():
     global llm
     llm = setup_llm()
 
-    #nodes
     workflow = StateGraph(AgentState)
     workflow.add_node("input",    get_user_query)
     workflow.add_node("classify", classify_query)
     workflow.add_node("rank",     rank_queries)
 
-    #edging
     workflow.add_edge(START,      "input")
     workflow.add_edge("input",    "classify")
     workflow.add_edge("classify", "rank")
